@@ -16,59 +16,87 @@ class LogService : AccessibilityService() {
     private var batchId = 0L
     private var lastOfferTs = 0L
     private var lastUnparsed = ""
+    private var lastRun = 0L
+    private var nodeCount = 0
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        note("connected")
+    }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val root = rootInActiveWindow ?: return
-        if (root.packageName?.toString() != "cab.snapp.driver") return
+        try {
+            val ev = event ?: return
+            if (ev.packageName?.toString() != "cab.snapp.driver") return
 
-        val texts = ArrayList<String>()
-        val descs = ArrayList<String>()
-        collect(root, texts, descs, 0)
-        if (texts.none { it.contains("قبول سفر") }) return
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastRun < 300) return
+            lastRun = nowMs
 
-        val now = System.currentTimeMillis()
-        val obj = OfferParser.parse(texts, now)
-        if (obj == null) {
-            saveUnparsed(texts, descs)
-            return
-        }
+            val root = rootInActiveWindow ?: return
+            if (root.packageName?.toString() != "cab.snapp.driver") return
 
-        // group cards of the same offer round into one batch
-        val prices = ArrayList<Long>()
-        prices.add(obj.getLong("price_toman"))
-        val arr = obj.getJSONArray("other_prices_toman")
-        for (i in 0 until arr.length()) prices.add(arr.getLong(i))
-        prices.sort()
-        val bk = prices.joinToString(",")
-        if (bk != batchKey || now - lastOfferTs > 120_000) {
-            batchKey = bk
-            batchId = now
-        }
-        lastOfferTs = now
-        obj.put("batch_id", batchId)
+            val texts = ArrayList<String>()
+            val descs = ArrayList<String>()
+            nodeCount = 0
+            collect(root, texts, descs, 0)
+            if (texts.none { it.contains("قبول سفر") }) return
 
-        val key = OfferParser.keyOf(obj)
-        if (key == pendingKey) return
+            val obj = OfferParser.parse(texts, nowMs)
+            if (obj == null) {
+                saveUnparsed(texts, descs)
+                return
+            }
 
-        val last = seen[key]
-        if (last != null && now - last < 600_000) {
-            // screen went back to an already recorded card
+            val prices = ArrayList<Long>()
+            prices.add(obj.getLong("price_toman"))
+            val arr = obj.getJSONArray("other_prices_toman")
+            for (i in 0 until arr.length()) prices.add(arr.getLong(i))
+            prices.sort()
+            val bk = prices.joinToString(",")
+            if (bk != batchKey || nowMs - lastOfferTs > 120_000) {
+                batchKey = bk
+                batchId = nowMs
+            }
+            lastOfferTs = nowMs
+            obj.put("batch_id", batchId)
+
+            val key = OfferParser.keyOf(obj)
+            if (key == pendingKey) return
+
+            val last = seen[key]
+            if (last != null && nowMs - last < 600_000) {
+                pendingRunnable?.let { handler.removeCallbacks(it) }
+                pendingKey = null
+                return
+            }
+
             pendingRunnable?.let { handler.removeCallbacks(it) }
-            pendingKey = null
-            return
+            pendingKey = key
+            val r = Runnable {
+                try {
+                    DataStore.append(applicationContext, obj)
+                    if (seen.size > 500) seen.clear()
+                    seen[key] = System.currentTimeMillis()
+                    if (pendingKey == key) pendingKey = null
+                } catch (e: Throwable) {
+                    note("save error: " + e)
+                }
+            }
+            pendingRunnable = r
+            handler.postDelayed(r, 700)
+        } catch (e: Throwable) {
+            note("event error: " + e + " " + (e.stackTrace.firstOrNull() ?: ""))
         }
+    }
 
-        // wait until the card stays unchanged for 0.7s before recording
-        pendingRunnable?.let { handler.removeCallbacks(it) }
-        pendingKey = key
-        val r = Runnable {
-            DataStore.append(applicationContext, obj)
-            if (seen.size > 500) seen.clear()
-            seen[key] = System.currentTimeMillis()
-            if (pendingKey == key) pendingKey = null
+    private fun note(msg: String) {
+        try {
+            getSharedPreferences("log", MODE_PRIVATE).edit()
+                .putString("status", System.currentTimeMillis().toString() + " " + msg)
+                .apply()
+        } catch (e: Throwable) {
         }
-        pendingRunnable = r
-        handler.postDelayed(r, 700)
     }
 
     private fun saveUnparsed(texts: List<String>, descs: List<String>) {
@@ -87,13 +115,22 @@ class LogService : AccessibilityService() {
         descs: MutableList<String>,
         depth: Int
     ) {
-        if (n == null || depth > 40) return
+        if (n == null || depth > 40 || nodeCount > 600) return
+        nodeCount++
         val t = n.text?.toString()
         val d = n.contentDescription?.toString()
         if (!t.isNullOrBlank()) texts.add(t)
         if (!d.isNullOrBlank()) descs.add(d)
-        for (i in 0 until n.childCount) collect(n.getChild(i), texts, descs, depth + 1)
+        for (i in 0 until n.childCount) {
+            val c = try { n.getChild(i) } catch (e: Throwable) { null }
+            collect(c, texts, descs, depth + 1)
+        }
     }
 
     override fun onInterrupt() {}
+
+    override fun onDestroy() {
+        note("destroyed")
+        super.onDestroy()
+    }
 }
