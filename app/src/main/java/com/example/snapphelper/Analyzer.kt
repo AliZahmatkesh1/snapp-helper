@@ -34,29 +34,14 @@ object Analyzer {
 
     // ---------- data ----------
 
-    private fun cardId(o: JSONObject): String = OfferParser.baseKeyOf(o) + "|" + o.opt("batch_id")
-
     @Synchronized
     fun ensureLoaded(ctx: Context) {
         if (loaded) return
         obs.clear()
         trips.clear()
-        val m = HashMap<String, JSONObject>()
-        val order = ArrayList<String>()
-        for (o in DataStore.readAll(ctx, DataStore.OBS)) {
+        for (o in DataStore.readObs(ctx)) {
             o.remove("raw")
-            val k = cardId(o)
-            val prev = m[k]
-            if (prev == null) {
-                m[k] = o
-                order.add(k)
-            } else if (!prev.optBoolean("has_km", false) && o.optBoolean("has_km", false)) {
-                m[k] = o
-            }
-        }
-        for (k in order) {
-            val o = m[k]
-            if (o != null) obs.add(o)
+            obs.add(o)
         }
         for (t in DataStore.readAll(ctx, DataStore.TRIPS)) trips.add(t)
         loaded = true
@@ -69,22 +54,22 @@ object Analyzer {
         loaded = true
     }
 
+    // same id = upgraded version of the same card (km arrived later)
     @Synchronized
     fun addObs(o: JSONObject) {
         val c = JSONObject(o.toString())
         c.remove("raw")
-        val id = cardId(c)
+        val id = c.optString("id")
         var idx = -1
         var i = obs.size - 1
-        while (i >= 0 && i >= obs.size - 80) {
-            if (cardId(obs[i]) == id) {
+        while (i >= 0 && i >= obs.size - 200) {
+            if (obs[i].optString("id") == id) {
                 idx = i
                 break
             }
             i--
         }
-        if (idx < 0) obs.add(c)
-        else if (!obs[idx].optBoolean("has_km", false) && c.optBoolean("has_km", false)) obs[idx] = c
+        if (idx >= 0) obs[idx] = c else obs.add(c)
     }
 
     @Synchronized
