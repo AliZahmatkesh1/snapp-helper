@@ -78,6 +78,9 @@ class MainActivity : Activity() {
         Toast.makeText(this, if (ok1 && ok2) "Saved to Downloads" else "Export failed", Toast.LENGTH_LONG).show()
     }
 
+
+
+
     private fun show() {
         val list = DataStore.readAll(this)
         val sb = StringBuilder()
@@ -86,18 +89,24 @@ class MainActivity : Activity() {
         val npk = list.map { it.optDouble("net_per_km") }.filter { !it.isNaN() }
         if (npm.isNotEmpty()) sb.append(String.format(Locale.US, "Avg net per min: %,.0f\n", npm.average()))
         if (npk.isNotEmpty()) sb.append(String.format(Locale.US, "Avg net per km: %,.0f\n", npk.average()))
+        val st = getSharedPreferences("log", MODE_PRIVATE).getString("status", "(none)")
+        sb.append("Service status: ").append(st).append('\n')
         sb.append('\n')
+        fun f(o: org.json.JSONObject, k: String, fmt: String): String {
+            val v = o.optDouble(k)
+            return if (v.isNaN()) "-" else String.format(Locale.US, fmt, v)
+        }
         for (o in list.takeLast(10).reversed()) {
             val lt = o.optString("local_time")
             val hm = if (lt.length >= 16) lt.substring(11, 16) else lt
             sb.append(
                 String.format(
                     Locale.US,
-                    "%s %s | %,d (net %,d) | %.0f+%.0f min | %.1f+%.1f km | %,d/min | %,d/km\n",
+                    "%s %s | %,d (net %,d) | %s+%s min | %s+%s km | %s/min | %s/km\n",
                     hm, o.optString("dow"), o.optLong("price_toman"), o.optLong("net_toman"),
-                    o.optDouble("pickup_min"), o.optDouble("trip_min"),
-                    o.optDouble("pickup_km"), o.optDouble("trip_km"),
-                    o.optLong("net_per_min"), o.optLong("net_per_km")
+                    f(o, "pickup_min", "%.0f"), f(o, "trip_min", "%.0f"),
+                    f(o, "pickup_km", "%.1f"), f(o, "trip_km", "%.1f"),
+                    f(o, "net_per_min", "%,.0f"), f(o, "net_per_km", "%,.0f")
                 )
             )
         }
@@ -105,4 +114,3 @@ class MainActivity : Activity() {
         if (un != null) sb.append("\n=== LAST UNPARSED OFFER SCREEN ===\n").append(un)
         tv.text = sb.toString()
     }
-}
