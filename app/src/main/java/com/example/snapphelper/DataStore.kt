@@ -16,8 +16,8 @@ object DataStore {
     const val TRIPS = "trips.jsonl"
 
     private val OBS_COLS = listOf(
-        "id", "ts", "local_time", "dow", "hour", "batch_id", "card_key", "kind", "stops",
-        "price_toman", "net_toman", "other_prices_toman",
+        "id", "ts", "local_time", "dow", "hour", "kind", "stops",
+        "price_toman", "net_toman",
         "pickup_min", "pickup_km", "trip_min", "trip_km",
         "total_min", "total_min_with_wait", "total_km", "has_km",
         "net_per_min", "net_per_min_with_wait", "net_per_km",
@@ -56,6 +56,16 @@ object DataStore {
         return out
     }
 
+    // cards: if the same id appears again (km upgrade), the last version wins
+    fun readObs(ctx: Context): List<JSONObject> {
+        val m = LinkedHashMap<String, JSONObject>()
+        for ((i, o) in readAll(ctx, OBS).withIndex()) {
+            val id = o.optString("id", "x$i")
+            m[id] = o
+        }
+        return m.values.toList()
+    }
+
     @Synchronized
     fun clearAll(ctx: Context) {
         File(ctx.filesDir, OBS).delete()
@@ -64,7 +74,7 @@ object DataStore {
 
     private fun toJson(cards: List<JSONObject>, trips: List<JSONObject>): String {
         val root = JSONObject()
-        root.put("schema", 3)
+        root.put("schema", 4)
         root.put("source", "snapp-helper")
         root.put("exported_at", System.currentTimeMillis())
         val a = JSONArray()
@@ -115,7 +125,7 @@ object DataStore {
 
     // returns a message for the user
     fun export(ctx: Context): String {
-        val cards = readAll(ctx, OBS)
+        val cards = readObs(ctx)
         val trips = readAll(ctx, TRIPS)
         if (cards.isEmpty() && trips.isEmpty()) return "No data yet"
         val stamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
