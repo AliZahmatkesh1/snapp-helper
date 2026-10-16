@@ -5,18 +5,17 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.os.Bundle
 import android.provider.Settings
+import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONObject
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 class MainActivity : Activity() {
-    private lateinit var tv: TextView
+    private lateinit var tvSum: TextView
+    private lateinit var tvList: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -33,8 +32,17 @@ class MainActivity : Activity() {
         b2.setOnClickListener { show() }
 
         val b3 = Button(this)
-        b3.text = "Export to Downloads (JSON + CSV)"
-        b3.setOnClickListener { export() }
+        b3.text = "Export to Downloads (JSON + 2 CSV)"
+        b3.setOnClickListener {
+            Thread {
+                val msg = try {
+                    DataStore.export(applicationContext)
+                } catch (e: Throwable) {
+                    "Export failed: $e"
+                }
+                runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+            }.start()
+        }
 
         val b4 = Button(this)
         b4.text = "Delete all data"
@@ -42,17 +50,33 @@ class MainActivity : Activity() {
             AlertDialog.Builder(this)
                 .setMessage("Delete all saved data?")
                 .setPositiveButton("Delete") { _, _ ->
-                    DataStore.clear(this)
+                    DataStore.clearAll(this)
+                    Analyzer.clear()
+                    getSharedPreferences("log", MODE_PRIVATE).edit()
+                        .remove("unparsed").remove("scr_pickup").remove("scr_trip").remove("scr_after")
+                        .remove("active").apply()
                     show()
                 }
                 .setNegativeButton("Cancel", null)
                 .show()
         }
 
-        tv = TextView(this)
-        tv.setTextIsSelectable(true)
+        tvSum = TextView(this)
+        tvSum.textSize = 14f
+        tvSum.layoutDirection = View.LAYOUT_DIRECTION_RTL
+        tvSum.textDirection = View.TEXT_DIRECTION_RTL
+        tvSum.setPadding(0, 16, 0, 16)
+
+        tvList = TextView(this)
+        tvList.textSize = 12f
+        tvList.setTextIsSelectable(true)
+
+        val inner = LinearLayout(this)
+        inner.orientation = LinearLayout.VERTICAL
+        inner.addView(tvSum)
+        inner.addView(tvList)
         val sv = ScrollView(this)
-        sv.addView(tv)
+        sv.addView(inner)
 
         ll.addView(b1)
         ll.addView(b2)
@@ -67,50 +91,39 @@ class MainActivity : Activity() {
         show()
     }
 
-    private fun export() {
-        val list = DataStore.readAll(this)
-        if (list.isEmpty()) {
-            Toast.makeText(this, "No data yet", Toast.LENGTH_SHORT).show()
-            return
-        }
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
-        val ok1 = DataStore.saveToDownloads(this, "snapp_data_$stamp.json", "application/json", DataStore.toJson(list))
-        val ok2 = DataStore.saveToDownloads(this, "snapp_data_$stamp.csv", "text/csv", DataStore.toCsv(list))
-        Toast.makeText(this, if (ok1 && ok2) "Saved to Downloads" else "Export failed", Toast.LENGTH_LONG).show()
-    }
-
-    private fun fmt(o: JSONObject, k: String, f: String): String {
-        val v = o.optDouble(k)
-        return if (v.isNaN()) "-" else String.format(Locale.US, f, v)
-    }
-
     private fun show() {
-        val list = DataStore.readAll(this)
-        val sb = StringBuilder()
-        sb.append("Records: ").append(list.size).append('\n')
-        val npm = list.map { it.optDouble("net_per_min") }.filter { !it.isNaN() }
-        val npk = list.map { it.optDouble("net_per_km") }.filter { !it.isNaN() }
-        if (npm.isNotEmpty()) sb.append(String.format(Locale.US, "Avg net per min: %,.0f\n", npm.average()))
-        if (npk.isNotEmpty()) sb.append(String.format(Locale.US, "Avg net per km: %,.0f\n", npk.average()))
-        val st = getSharedPreferences("log", MODE_PRIVATE).getString("status", "(none)")
-        sb.append("Service status: ").append(st).append('\n')
-        sb.append('\n')
-        for (o in list.takeLast(10).reversed()) {
-            val lt = o.optString("local_time")
-            val hm = if (lt.length >= 16) lt.substring(11, 16) else lt
-            sb.append(
-                String.format(
-                    Locale.US,
-                    "%s %s | %,d (net %,d) | %s+%s min | %s+%s km | %s/min | %s/km\n",
-                    hm, o.optString("dow"), o.optLong("price_toman"), o.optLong("net_toman"),
-                    fmt(o, "pickup_min", "%.0f"), fmt(o, "trip_min", "%.0f"),
-                    fmt(o, "pickup_km", "%.1f"), fmt(o, "trip_km", "%.1f"),
-                    fmt(o, "net_per_min", "%,.0f"), fmt(o, "net_per_km", "%,.0f")
-                )
-            )
-        }
-        val un = getSharedPreferences("log", MODE_PRIVATE).getString("unparsed", null)
-        if (un != null) sb.append("\n=== LAST UNPARSED OFFER SCREEN ===\n").append(un)
-        tv.text = sb.toString()
+        Thread {
+            val res: Pair<String, String> = try {
+                Analyzer.ensureLoaded(applicationContext)
+                val p = getSharedPreferences("log", MODE_PRIVATE)
+                val sb = StringBuilder()
+                sb.append("Service status: ").append(p.getString("status", "(none)")).append('\n')
+                val act = p.getString("active", null)
+                if (act != null) {
+                    val st = try {
+                        JSONObject(act).optInt("state")
+                    } catch (e: Throwable) {
+                        -1
+                    }
+                    sb.append("Active trip state: ").append(st).append(" (1 pickup, 2 trip)\n")
+                }
+                sb.append('\n').append(Analyzer.listText())
+                val sp = p.getString("scr_pickup", null)
+                val stp = p.getString("scr_trip", null)
+                val saf = p.getString("scr_after", null)
+                if (sp != null) sb.append("\n=== scr_pickup ===\n").append(sp)
+                if (stp != null) sb.append("\n=== scr_trip ===\n").append(stp)
+                if (saf != null) sb.append("\n=== scr_after ===\n").append(saf)
+                val un = p.getString("unparsed", null)
+                if (un != null) sb.append("\n=== LAST UNPARSED OFFER SCREEN ===\n").append(un)
+                Pair(Analyzer.summary(), sb.toString())
+            } catch (e: Throwable) {
+                Pair("error: $e", "")
+            }
+            runOnUiThread {
+                tvSum.text = res.first
+                tvList.text = res.second
+            }
+        }.start()
     }
 }
