@@ -7,26 +7,43 @@ import android.provider.MediaStore
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 object DataStore {
-    private const val FILE = "observations.jsonl"
+    const val OBS = "observations.jsonl"
+    const val TRIPS = "trips.jsonl"
 
-    private val COLS = listOf(
-        "id", "ts", "local_time", "dow", "hour", "batch_id", "kind",
+    private val OBS_COLS = listOf(
+        "id", "ts", "local_time", "dow", "hour", "batch_id", "card_key", "kind", "stops",
         "price_toman", "net_toman", "other_prices_toman",
         "pickup_min", "pickup_km", "trip_min", "trip_km",
-        "total_min", "total_km", "net_per_min", "net_per_km",
-        "surge_toman", "phone_deduction_toman", "origin", "destination"
+        "total_min", "total_min_with_wait", "total_km", "has_km",
+        "net_per_min", "net_per_min_with_wait", "net_per_km",
+        "surge_toman", "phone_deduction_toman", "wait_min_low", "wait_min_high",
+        "pro", "suggested", "long_trip", "tags",
+        "origin", "origin_area", "destination", "dest_area", "destinations"
+    )
+
+    private val TRIP_COLS = listOf(
+        "id", "offer_id", "accept_ts", "arrive_ts", "end_ts", "local_time", "dow", "hour",
+        "kind", "stops", "price_toman", "net_toman",
+        "est_pickup_min", "est_pickup_km", "est_trip_min", "est_trip_km",
+        "real_pickup_min", "real_trip_min", "real_total_min",
+        "real_to_est_pickup", "real_to_est_trip", "net_per_real_min",
+        "wait_min_low", "wait_min_high",
+        "origin", "origin_area", "destination", "dest_area", "destinations", "valid"
     )
 
     @Synchronized
-    fun append(ctx: Context, obj: JSONObject) {
-        File(ctx.filesDir, FILE).appendText(obj.toString() + "\n", Charsets.UTF_8)
+    fun append(ctx: Context, file: String, obj: JSONObject) {
+        File(ctx.filesDir, file).appendText(obj.toString() + "\n", Charsets.UTF_8)
     }
 
     @Synchronized
-    fun readAll(ctx: Context): List<JSONObject> {
-        val f = File(ctx.filesDir, FILE)
+    fun readAll(ctx: Context, file: String): List<JSONObject> {
+        val f = File(ctx.filesDir, file)
         if (!f.exists()) return emptyList()
         val out = ArrayList<JSONObject>()
         for (line in f.readLines(Charsets.UTF_8)) {
@@ -40,26 +57,30 @@ object DataStore {
     }
 
     @Synchronized
-    fun clear(ctx: Context) {
-        File(ctx.filesDir, FILE).delete()
+    fun clearAll(ctx: Context) {
+        File(ctx.filesDir, OBS).delete()
+        File(ctx.filesDir, TRIPS).delete()
     }
 
-    fun toJson(list: List<JSONObject>): String {
+    private fun toJson(cards: List<JSONObject>, trips: List<JSONObject>): String {
         val root = JSONObject()
-        root.put("schema", 1)
+        root.put("schema", 3)
         root.put("source", "snapp-helper")
         root.put("exported_at", System.currentTimeMillis())
-        val arr = JSONArray()
-        for (o in list) arr.put(o)
-        root.put("records", arr)
+        val a = JSONArray()
+        for (o in cards) a.put(o)
+        val b = JSONArray()
+        for (o in trips) b.put(o)
+        root.put("cards", a)
+        root.put("trips", b)
         return root.toString(1)
     }
 
-    fun toCsv(list: List<JSONObject>): String {
+    private fun toCsv(list: List<JSONObject>, cols: List<String>): String {
         val sb = StringBuilder("\uFEFF")
-        sb.append(COLS.joinToString(",")).append("\r\n")
+        sb.append(cols.joinToString(",")).append("\r\n")
         for (o in list) {
-            sb.append(COLS.joinToString(",") { cell(o, it) }).append("\r\n")
+            sb.append(cols.joinToString(",") { cell(o, it) }).append("\r\n")
         }
         return sb.toString()
     }
@@ -76,7 +97,7 @@ object DataStore {
         } else s
     }
 
-    fun saveToDownloads(ctx: Context, name: String, mime: String, content: String): Boolean {
+    private fun saveToDownloads(ctx: Context, name: String, mime: String, content: String): Boolean {
         return try {
             val values = ContentValues()
             values.put(MediaStore.Downloads.DISPLAY_NAME, name)
@@ -90,5 +111,17 @@ object DataStore {
         } catch (e: Exception) {
             false
         }
+    }
+
+    // returns a message for the user
+    fun export(ctx: Context): String {
+        val cards = readAll(ctx, OBS)
+        val trips = readAll(ctx, TRIPS)
+        if (cards.isEmpty() && trips.isEmpty()) return "No data yet"
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmm", Locale.US).format(Date())
+        val ok1 = saveToDownloads(ctx, "snapp_data_$stamp.json", "application/json", toJson(cards, trips))
+        val ok2 = saveToDownloads(ctx, "snapp_cards_$stamp.csv", "text/csv", toCsv(cards, OBS_COLS))
+        val ok3 = saveToDownloads(ctx, "snapp_trips_$stamp.csv", "text/csv", toCsv(trips, TRIP_COLS))
+        return if (ok1 && ok2 && ok3) "Saved 3 files to Downloads" else "Export failed"
     }
 }
