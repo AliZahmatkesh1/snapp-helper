@@ -14,8 +14,8 @@ object OfferParser {
 
     private val PRICE_LINE = Regex("^[0-9][0-9’'‘٬,،. ]*$")
     private const val NUM = "([0-9]+(?:[.٫/][0-9]+)?)"
-    private val KM = Regex(NUM + "\\s*کیلومتر")
-    private val METER = Regex(NUM + "\\s*متر")
+    private val KM = Regex(NUM + "\\s*(?:کیلومتر|ک\\.?\\s*م)")
+    private val METER = Regex(NUM + "\\s*(?:متر|م)(?![\\u0600-\\u06FF])")
     private val MIN = Regex(NUM + "\\s*دقیقه")
     private val HOUR = Regex(NUM + "\\s*ساعت")
     private val ANY_NUM = Regex("[0-9]+(?:[.٫/][0-9]+)?")
@@ -51,15 +51,13 @@ object OfferParser {
         var kmToken: String? = null
         val k = KM.find(line)
         if (k != null) {
-            val tok = k.groupValues[1]
-            kmToken = tok
-            km = num(tok)
+            kmToken = k.groupValues[1]
+            km = num(kmToken)
         } else {
             val m = METER.find(line)
             if (m != null) {
-                val tok = m.groupValues[1]
-                kmToken = tok
-                km = num(tok)?.div(1000.0)
+                kmToken = m.groupValues[1]
+                km = num(kmToken)?.div(1000.0)
             }
         }
         var minutes: Double? = null
@@ -83,6 +81,8 @@ object OfferParser {
     fun parse(texts: List<String>, now: Long): JSONObject? {
         val lines = texts.map { normalizeDigits(it.trim()) }
         if (lines.none { it.contains("قبول سفر") }) return null
+        // shared trips are ignored completely
+        if (lines.any { it.contains("اشتراکی") }) return null
 
         val pickupIdx = lines.indexOfFirst { PICKUP.containsMatchIn(it) && it.contains("دقیقه") }
         if (pickupIdx < 0) return null
@@ -99,22 +99,22 @@ object OfferParser {
         val selected = prices.lastOrNull { it.first < pickupIdx } ?: return null
         val others = prices.filter { it.first != selected.first }.map { it.second }
 
+        // trip segment: first "minutes" line after the pickup line (km is optional)
         val tripIdx = lines.indices.firstOrNull {
-            it > pickupIdx && lines[it].contains("دقیقه") &&
-                (KM.containsMatchIn(lines[it]) || METER.containsMatchIn(lines[it]))
+            it > pickupIdx && lines[it].contains("دقیقه") && !PICKUP.containsMatchIn(lines[it])
         } ?: return null
 
         val pickup = segment(lines[pickupIdx])
         val trip = segment(lines[tripIdx])
         val pMin = pickup.first ?: return null
         val tMin = trip.first ?: return null
-        val tKm = trip.second ?: return null
         val pKm = pickup.second
+        val tKm = trip.second
 
         val origin = lines.getOrNull(pickupIdx + 1)
             ?.takeIf { !it.contains("دقیقه") && !it.contains("قبول") }
         val destination = lines.getOrNull(tripIdx + 1)
-            ?.takeIf { !it.contains("قبول") }
+            ?.takeIf { !it.contains("قبول") && !it.contains("جزئیات") }
 
         var surge: Long? = null
         var phoneDed: Long? = null
@@ -129,7 +129,8 @@ object OfferParser {
         val price = selected.second
         val net = Math.round(price * NET_RATE)
         val totalMin = pMin + tMin
-        val totalKm: Double? = if (pKm != null) r2(pKm + tKm) else null
+        // km is only valid when both parts are known
+        val totalKm: Double? = if (pKm != null && tKm != null) r2(pKm + tKm) else null
 
         val d = Date(now)
         val local = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US).format(d)
@@ -150,9 +151,10 @@ object OfferParser {
         o.put("pickup_min", pMin)
         o.put("pickup_km", pKm ?: JSONObject.NULL)
         o.put("trip_min", tMin)
-        o.put("trip_km", tKm)
+        o.put("trip_km", tKm ?: JSONObject.NULL)
         o.put("total_min", totalMin)
         o.put("total_km", totalKm ?: JSONObject.NULL)
+        o.put("has_km", totalKm != null)
         o.put("net_per_min", if (totalMin > 0) Math.round(net / totalMin) else JSONObject.NULL)
         o.put("net_per_km", if (totalKm != null && totalKm > 0) Math.round(net / totalKm) else JSONObject.NULL)
         o.put("surge_toman", surge ?: JSONObject.NULL)
