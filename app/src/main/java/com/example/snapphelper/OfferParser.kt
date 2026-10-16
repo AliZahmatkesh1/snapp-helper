@@ -88,13 +88,14 @@ object OfferParser {
         return if (first == "مشهد" && parts.size > 1) parts[1] else first
     }
 
-    fun keyOf(o: JSONObject): String =
-        listOf("price_toman", "pickup_min", "pickup_km", "trip_min", "trip_km", "origin", "destination")
+    // identity of a card: everything except km (km appears later after "details")
+    fun idKey(o: JSONObject): String =
+        listOf("price_toman", "pickup_min", "trip_min", "origin", "destinations")
             .joinToString("|") { o.opt(it).toString() }
 
-    // same offer card regardless of whether km are shown
-    fun baseKeyOf(o: JSONObject): String =
-        listOf("price_toman", "pickup_min", "trip_min", "origin", "destination")
+    // full content, used to detect screen changes (includes km)
+    fun fullKey(o: JSONObject): String =
+        listOf("price_toman", "pickup_min", "pickup_km", "trip_min", "trip_km", "origin", "destinations")
             .joinToString("|") { o.opt(it).toString() }
 
     fun parse(texts: List<String>, now: Long): JSONObject? {
@@ -106,15 +107,15 @@ object OfferParser {
         val pickupIdx = lines.indexOfFirst { PICKUP.containsMatchIn(it) && it.contains("دقیقه") }
         if (pickupIdx < 0) return null
 
-        val prices = ArrayList<Pair<Int, Long>>()
-        for (i in 0 until lines.size - 1) {
-            if (lines[i + 1] == "تومان" && PRICE_LINE.matches(lines[i])) {
+        // only the opened card: the last price before its pickup line
+        var selected: Long? = null
+        for (i in 0 until pickupIdx) {
+            if (i + 1 < lines.size && lines[i + 1] == "تومان" && PRICE_LINE.matches(lines[i])) {
                 val digits = lines[i].filter { it.isDigit() }
-                if (digits.length in 4..9) prices.add(Pair(i, digits.toLong()))
+                if (digits.length in 4..9) selected = digits.toLong()
             }
         }
-        val selected = prices.lastOrNull { it.first < pickupIdx } ?: return null
-        val others = prices.filter { it.first != selected.first }.map { it.second }
+        val price = selected ?: return null
 
         val pickup = segment(lines[pickupIdx])
         val pMin = pickup.first ?: return null
@@ -192,7 +193,6 @@ object OfferParser {
         if (noTime && destinations.isEmpty()) return null
         val multi = destinations.size >= 2
 
-        val price = selected.second
         val net = Math.round(price * NET_RATE)
         val waitAvg = if (waitLow != null && waitHigh != null) (waitLow + waitHigh) / 2.0 else 0.0
 
@@ -216,7 +216,7 @@ object OfferParser {
         val hour = Calendar.getInstance().apply { timeInMillis = now }.get(Calendar.HOUR_OF_DAY)
 
         val o = JSONObject()
-        o.put("schema", 3)
+        o.put("schema", 4)
         o.put("id", UUID.randomUUID().toString())
         o.put("ts", now)
         o.put("local_time", local)
@@ -232,7 +232,6 @@ object OfferParser {
         o.put("wait_min_high", waitHigh ?: JSONObject.NULL)
         o.put("price_toman", price)
         o.put("net_toman", net)
-        o.put("other_prices_toman", JSONArray(others))
         o.put("pickup_min", pMin)
         o.put("pickup_km", pKm ?: JSONObject.NULL)
         o.put("trip_min", tMin ?: JSONObject.NULL)
