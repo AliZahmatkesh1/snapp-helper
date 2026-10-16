@@ -21,6 +21,7 @@ object OfferParser {
     private val ANY_NUM = Regex("[0-9]+(?:[.٫/][0-9]+)?")
     private val AMOUNT = Regex("[0-9][0-9’'‘٬,،]*")
     private val PICKUP = Regex("تا\\s*مبد[أا]")
+    private val WAIT = Regex("([0-9]+)\\s*تا\\s*([0-9]+)\\s*دقیقه\\s*توقف")
 
     fun normalizeDigits(s: String): String {
         val sb = StringBuilder(s.length)
@@ -74,8 +75,20 @@ object OfferParser {
         return Pair(minutes, km)
     }
 
+    private fun isAddress(l: String): Boolean =
+        l.startsWith("مشهد") || (l.contains("،") && !l.contains("دقیقه"))
+
+    private fun isTimeLine(l: String): Boolean =
+        l.contains("دقیقه") && !WAIT.containsMatchIn(l) && !l.contains("تا") ||
+            (l.contains("دقیقه") && PICKUP.containsMatchIn(l))
+
     fun keyOf(o: JSONObject): String =
         listOf("price_toman", "pickup_min", "pickup_km", "trip_min", "trip_km", "origin", "destination")
+            .joinToString("|") { o.opt(it).toString() }
+
+    // same offer card regardless of whether km are shown
+    fun baseKeyOf(o: JSONObject): String =
+        listOf("price_toman", "pickup_min", "trip_min", "origin", "destination")
             .joinToString("|") { o.opt(it).toString() }
 
     fun parse(texts: List<String>, now: Long): JSONObject? {
@@ -95,26 +108,53 @@ object OfferParser {
                 if (digits.length in 4..9) prices.add(Pair(i, digits.toLong()))
             }
         }
-        // the selected card's price is the last price before the pickup line
         val selected = prices.lastOrNull { it.first < pickupIdx } ?: return null
         val others = prices.filter { it.first != selected.first }.map { it.second }
 
-        // trip segment: first "minutes" line after the pickup line (km is optional)
-        val tripIdx = lines.indices.firstOrNull {
-            it > pickupIdx && lines[it].contains("دقیقه") && !PICKUP.containsMatchIn(lines[it])
-        } ?: return null
-
         val pickup = segment(lines[pickupIdx])
-        val trip = segment(lines[tripIdx])
         val pMin = pickup.first ?: return null
-        val tMin = trip.first ?: return null
         val pKm = pickup.second
-        val tKm = trip.second
 
-        val origin = lines.getOrNull(pickupIdx + 1)
-            ?.takeIf { !it.contains("دقیقه") && !it.contains("قبول") }
-        val destination = lines.getOrNull(tripIdx + 1)
-            ?.takeIf { !it.contains("قبول") && !it.contains("جزئیات") }
+        // everything between the pickup line and the accept button
+        val acceptIdx = lines.indexOfFirst { it.contains("قبول سفر") }
+        val endIdx = if (acceptIdx > pickupIdx) acceptIdx else lines.size
+
+        // trip time lines (legs with minutes), excluding wait/pickup lines
+        val legIdx = ArrayList<Int>()
+        for (i in pickupIdx + 1 until endIdx) {
+            val l = lines[i]
+            if (l.contains("دقیقه") && !WAIT.containsMatchIn(l) && !PICKUP.containsMatchIn(l)) legIdx.add(i)
+        }
+
+        // addresses after the pickup line
+        val addresses = ArrayList<String>()
+        for (i in pickupIdx + 1 until endIdx) {
+            val l = lines[i]
+            if (isAddress(l) && !l.contains("دقیقه")) addresses.add(l)
+        }
+        val origin = addresses.getOrNull(0)
+        val destinations = if (addresses.size > 1) addresses.drop(1) else emptyList()
+
+        var waitLow: Int? = null
+        var waitHigh: Int? = null
+        val tags = ArrayList<String>()
+        var pro = false
+        var suggested = false
+        for (i in pickupIdx + 1 until endIdx) {
+            val l = lines[i]
+            val w = WAIT.find(l)
+            if (w != null) {
+                waitLow = w.groupValues[1].toIntOrNull()
+                waitHigh = w.groupValues[2].toIntOrNull()
+            } else if (l.contains("پرو")) {
+                pro = true
+            } else if (!l.contains("دقیقه") && !isAddress(l) && !l.contains("جزئیات") &&
+                !PRICE_LINE.matches(l) && l != "تومان" && l.length < 40
+            ) {
+                tags.add(l)
+            }
+        }
+        if (lines.any { it.contains("سفر پیشنهادی") }) suggested = true
 
         var surge: Long? = null
         var phoneDed: Long? = null
@@ -126,11 +166,42 @@ object OfferParser {
             if (l.contains("خدمات تلفنی") && l.contains("کسر")) phoneDed = amountIn(l)
         }
 
+        // legs
+        var tMin: Double? = null
+        var tKm: Double? = null
+        var kmKnown = true
+        if (legIdx.isNotEmpty()) {
+            var sumMin = 0.0
+            var sumKm = 0.0
+            for (i in legIdx) {
+                val s = segment(lines[i])
+                sumMin += s.first ?: 0.0
+                if (s.second != null) sumKm += s.second!! else kmKnown = false
+            }
+            tMin = sumMin
+            tKm = if (kmKnown) r2(sumKm) else null
+        }
+
+        // more than one destination but no leg times: multi stop with unknown trip time
+        val multiStop = destinations.size >= 2 || (legIdx.isEmpty() && destinations.isNotEmpty())
+        val hasTripTime = tMin != null && !multiStop
+        if (!multiStop && tMin == null) return null
+
         val price = selected.second
         val net = Math.round(price * NET_RATE)
-        val totalMin = pMin + tMin
-        // km is only valid when both parts are known
-        val totalKm: Double? = if (pKm != null && tKm != null) r2(pKm + tKm) else null
+        val waitAvg = if (waitLow != null && waitHigh != null) (waitLow + waitHigh) / 2.0 else 0.0
+
+        val totalMin: Double? = if (hasTripTime) pMin + tMin!! else null
+        val totalMinWithWait: Double? = if (totalMin != null) totalMin + waitAvg else null
+        val totalKm: Double? =
+            if (hasTripTime && pKm != null && tKm != null) r2(pKm + tKm) else null
+
+        val kind = when {
+            lines.any { it.contains("قبول سفر تلفنی") } -> "phone"
+            multiStop -> "multi_stop"
+            else -> "normal"
+        }
+        val longTrip = totalMin != null && totalMin > 60
 
         val d = Date(now)
         val local = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US).format(d)
@@ -138,29 +209,42 @@ object OfferParser {
         val hour = Calendar.getInstance().apply { timeInMillis = now }.get(Calendar.HOUR_OF_DAY)
 
         val o = JSONObject()
-        o.put("schema", 1)
+        o.put("schema", 2)
         o.put("id", UUID.randomUUID().toString())
         o.put("ts", now)
         o.put("local_time", local)
         o.put("dow", dow)
         o.put("hour", hour)
-        o.put("kind", if (lines.any { it.contains("قبول سفر تلفنی") }) "phone" else "normal")
+        o.put("kind", kind)
+        o.put("stops", if (multiStop) maxOf(destinations.size, 2) else 1)
+        o.put("long_trip", longTrip)
+        o.put("pro", pro)
+        o.put("suggested", suggested)
+        o.put("tags", JSONArray(tags))
+        o.put("wait_min_low", waitLow ?: JSONObject.NULL)
+        o.put("wait_min_high", waitHigh ?: JSONObject.NULL)
         o.put("price_toman", price)
         o.put("net_toman", net)
         o.put("other_prices_toman", JSONArray(others))
         o.put("pickup_min", pMin)
         o.put("pickup_km", pKm ?: JSONObject.NULL)
-        o.put("trip_min", tMin)
-        o.put("trip_km", tKm ?: JSONObject.NULL)
-        o.put("total_min", totalMin)
+        o.put("trip_min", if (hasTripTime) tMin else JSONObject.NULL)
+        o.put("trip_km", if (hasTripTime) (tKm ?: JSONObject.NULL) else JSONObject.NULL)
+        o.put("total_min", totalMin ?: JSONObject.NULL)
+        o.put("total_min_with_wait", totalMinWithWait ?: JSONObject.NULL)
         o.put("total_km", totalKm ?: JSONObject.NULL)
         o.put("has_km", totalKm != null)
-        o.put("net_per_min", if (totalMin > 0) Math.round(net / totalMin) else JSONObject.NULL)
+        o.put("net_per_min", if (totalMin != null && totalMin > 0) Math.round(net / totalMin) else JSONObject.NULL)
+        o.put(
+            "net_per_min_with_wait",
+            if (totalMinWithWait != null && totalMinWithWait > 0) Math.round(net / totalMinWithWait) else JSONObject.NULL
+        )
         o.put("net_per_km", if (totalKm != null && totalKm > 0) Math.round(net / totalKm) else JSONObject.NULL)
         o.put("surge_toman", surge ?: JSONObject.NULL)
         o.put("phone_deduction_toman", phoneDed ?: JSONObject.NULL)
         o.put("origin", origin ?: JSONObject.NULL)
-        o.put("destination", destination ?: JSONObject.NULL)
+        o.put("destination", if (destinations.isNotEmpty()) destinations[0] else JSONObject.NULL)
+        o.put("destinations", JSONArray(destinations))
         o.put("raw", JSONArray(texts))
         return o
     }
