@@ -3,5 +3,6 @@
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagIncludeNotImportantViews|flagReportViewIds"
     android:canRetrieveWindowContent="true"
-    android:notificationTimeout="200"
+    android:notificationTimeout="100"
+    android:packageNames="cab.snapp.driver"
     android:description="@string/desc" />
