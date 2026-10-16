@@ -41,6 +41,7 @@ class LogService : AccessibilityService() {
             nodeCount = 0
             collect(root, texts, descs, 0)
             if (texts.none { it.contains("قبول سفر") }) return
+            if (texts.any { it.contains("اشتراکی") }) return
 
             val obj = OfferParser.parse(texts, nowMs)
             if (obj == null) {
