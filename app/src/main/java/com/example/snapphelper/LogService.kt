@@ -13,6 +13,10 @@ class LogService : AccessibilityService() {
     private val SNAPP = "cab.snapp.driver"
     private val HIDE_MS = 15_000L
     private val FINALIZE_MS = 90_000L
+    private val DEDUP_MS = 35_000L
+    private val SETTLE_MS = 800L
+
+    private class Rec(val id: String, var ts: Long, var hasKm: Boolean)
 
     private val handler = Handler(Looper.getMainLooper())
     private val exec = Executors.newSingleThreadExecutor()
@@ -26,12 +30,10 @@ class LogService : AccessibilityService() {
     // offers
     private var lastOffer: JSONObject? = null
     private var lastOfferTs = 0L
-    private var batchKey = ""
-    private var batchId = 0L
-    private val pend = HashMap<String, Runnable>()
-    private val pendFull = HashMap<String, String>()
-    private val seenTs = HashMap<String, Long>()
-    private val seenKm = HashMap<String, Boolean>()
+    private val recent = HashMap<String, Rec>()
+    private var pendingId: String? = null
+    private var pendingObj: JSONObject? = null
+    private var pendingRunnable: Runnable? = null
 
     // overlay
     private var lastKey = ""
@@ -128,27 +130,11 @@ class LogService : AccessibilityService() {
             return
         }
 
-        // cards of the same offer round share a batch id
-        val prices = ArrayList<Long>()
-        prices.add(obj.getLong("price_toman"))
-        val arr = obj.getJSONArray("other_prices_toman")
-        for (i in 0 until arr.length()) prices.add(arr.getLong(i))
-        prices.sort()
-        val bk = prices.joinToString(",")
-        if (bk != batchKey || now - lastOfferTs > 120_000) {
-            batchKey = bk
-            batchId = now
-        }
-
-        val key = OfferParser.keyOf(obj)
-        val base = OfferParser.baseKeyOf(obj)
-        obj.put("batch_id", batchId)
-        obj.put("card_key", base)
         lastOffer = obj
         lastOfferTs = now
 
-        showFor(obj, key)
-        recordCard(obj, key, base, now)
+        showFor(obj, OfferParser.fullKey(obj))
+        recordCard(obj, now)
     }
 
     private fun showFor(obj: JSONObject, key: String) {
@@ -189,53 +175,83 @@ class LogService : AccessibilityService() {
         overlay?.hide()
     }
 
-    private fun recordCard(obj: JSONObject, key: String, base: String, now: Long) {
+    private fun cancelPending() {
+        pendingRunnable?.let { handler.removeCallbacks(it) }
+        pendingRunnable = null
+        pendingId = null
+        pendingObj = null
+    }
+
+    private fun recordCard(obj: JSONObject, now: Long) {
+        val idk = OfferParser.idKey(obj)
         val hasKm = obj.optBoolean("has_km", false)
-        val kind = obj.optString("kind")
-        val needsKm = (kind == "normal" || kind == "phone") && !hasKm
 
-        val savedTs = seenTs[base]
-        val savedKm = seenKm[base] == true
-        if (savedTs != null && now - savedTs < 600_000 && (savedKm || !hasKm)) return
-        if (pendFull[base] == key) return
+        // seen and recorded within the last 35 seconds
+        val rec = recent[idk]
+        if (rec != null && now - rec.ts < DEDUP_MS) {
+            rec.ts = now
+            if (hasKm && !rec.hasKm) {
+                // km arrived: upgrade the same record (same id)
+                obj.put("id", rec.id)
+                DataStore.append(applicationContext, DataStore.OBS, obj)
+                Analyzer.addObs(obj)
+                rec.hasKm = true
+            }
+            return
+        }
 
-        pend[base]?.let { handler.removeCallbacks(it) }
-        pendFull[base] = key
-        val delay = if (needsKm) 3500L else 700L
+        // same card already waiting to be saved
+        if (pendingId == idk) {
+            val cur = pendingObj
+            if (hasKm || cur == null || !cur.optBoolean("has_km", false)) pendingObj = obj
+            return
+        }
+
+        // a different card replaces the waiting one (quick flipping is not recorded)
+        cancelPending()
+        pendingId = idk
+        pendingObj = obj
         val r = Runnable {
             try {
-                pend.remove(base)
-                pendFull.remove(base)
-                saveObs(obj, base)
+                val o = pendingObj
+                pendingRunnable = null
+                pendingId = null
+                pendingObj = null
+                if (o != null) saveNow(o)
             } catch (e: Throwable) {
                 note("save error: $e")
             }
         }
-        pend[base] = r
-        handler.postDelayed(r, delay)
+        pendingRunnable = r
+        handler.postDelayed(r, SETTLE_MS)
     }
 
-    private fun saveObs(obj: JSONObject, base: String) {
-        DataStore.append(applicationContext, DataStore.OBS, obj)
-        Analyzer.addObs(obj)
-        if (seenTs.size > 500) {
-            seenTs.clear()
-            seenKm.clear()
-        }
-        seenTs[base] = System.currentTimeMillis()
-        seenKm[base] = obj.optBoolean("has_km", false)
+    private fun saveNow(o: JSONObject) {
+        DataStore.append(applicationContext, DataStore.OBS, o)
+        Analyzer.addObs(o)
+        if (recent.size > 300) recent.clear()
+        recent[OfferParser.idKey(o)] = Rec(o.optString("id"), System.currentTimeMillis(), o.optBoolean("has_km", false))
     }
 
+    // make sure the accepted card is saved before the trip starts
     private fun flushOffer(off: JSONObject) {
-        val base = OfferParser.baseKeyOf(off)
-        val p = pend[base]
-        if (p != null) {
-            handler.removeCallbacks(p)
-            pend.remove(base)
-            pendFull.remove(base)
+        val idk = OfferParser.idKey(off)
+        if (pendingId == idk) {
+            val o = pendingObj
+            cancelPending()
+            if (o != null) saveNow(o)
         }
-        val saved = seenTs[base] != null && (seenKm[base] == true || !off.optBoolean("has_km", false))
-        if (!saved) saveObs(off, base)
+        val rec = recent[idk]
+        if (rec == null) {
+            saveNow(off)
+        } else {
+            off.put("id", rec.id)
+            if (off.optBoolean("has_km", false) && !rec.hasKm) {
+                DataStore.append(applicationContext, DataStore.OBS, off)
+                Analyzer.addObs(off)
+                rec.hasKm = true
+            }
+        }
     }
 
     // ---------- trip states ----------
